@@ -290,11 +290,13 @@ STATS_SQL
 
                 ALL=0
                 CSV=0
+                NDJSON=0
                 ARGS=()
                 for arg in "$@"; do
                   case "$arg" in
                     --all) ALL=1 ;;
                     --csv) CSV=1 ;;
+                    --ndjson) NDJSON=1 ;;
                     *) ARGS+=("$arg") ;;
                   esac
                 done
@@ -304,8 +306,10 @@ STATS_SQL
                 query() {
                   if [ "$CSV" = 1 ]; then
                     printf '.mode csv\n%s\n' "$1" | ${duckdb} -readonly "$DB"
+                  elif [ "$NDJSON" = 1 ]; then
+                    printf '.mode json\n%s\n' "$1" | ${duckdb} -readonly "$DB" | ${jq} -c '.[]'
                   else
-                    printf '.maxrows 100000\n%s\n' "$1" | ${duckdb} -readonly "$DB"
+                    printf '.mode table\n.maxrows 100000\n%s\n' "$1" | ${duckdb} -readonly "$DB"
                   fi
                 }
 
@@ -328,6 +332,7 @@ STATS_SQL
                   echo ""
                   echo "Commands:"
                   echo "  search <term>         Search packages by name/description"
+                  echo "  maintainers <attr>    Maintainers of a package"
                   echo "  maintainer <github>   Packages by maintainer GitHub handle"
                   echo "  top-maintainers       Top maintainers by package count"
                   echo "  orphans               Packages with no maintainers"
@@ -339,11 +344,13 @@ STATS_SQL
                   echo "  deps <attr>           Transitive dependencies (needs enrich)"
                   echo "  direct-deps <attr> [depth]  Dependencies to given depth (needs enrich)"
                   echo "  dep-maintainers <attr> Maintainers of transitive deps (needs enrich)"
+                  echo "  stats                 Database sizes and row counts"
                   echo "  db [args...]          Raw DuckDB session"
                   echo ""
                   echo "Options:"
-                  echo "  --all   Show full results (no row limits or truncation)"
-                  echo "  --csv   Output as CSV"
+                  echo "  --all      Show full results (no row limits or truncation)"
+                  echo "  --csv      Output as CSV"
+                  echo "  --ndjson   Output as NDJSON (one JSON object per line)"
                   echo ""
                   echo "Run 'nix-facts-enrich' to enable deps/dep-maintainers commands."
                 }
@@ -363,6 +370,16 @@ STATS_SQL
                 WHERE attr ILIKE '%' || '$ARG' || '%'
                    OR description ILIKE '%' || '$ARG' || '%'
                 ORDER BY attr $LIMIT;"
+                    ;;
+
+                  maintainers)
+                    ARG="''${ARGS[1]:-}"
+                    if [ -z "$ARG" ]; then echo "Usage: nix-facts maintainers <attr>" >&2; exit 1; fi
+                    ARG=$(printf '%s' "$ARG" | sed "s/'/'''/g")
+                    query "SELECT pm.maintainer_github, pm.maintainer_name
+                FROM package_maintainers pm
+                WHERE pm.attr ILIKE '$ARG'
+                ORDER BY pm.maintainer_github;"
                     ;;
 
                   maintainer)
@@ -553,6 +570,98 @@ STATS_SQL
                 ORDER BY package_count DESC $LIMIT;"
                     ;;
 
+                  stats)
+                    if [ "$NDJSON" = 1 ]; then
+                      # File info as NDJSON
+                      BASE_SIZE="null"; BASE_EXISTS="false"
+                      if [ -f "${base-db}" ]; then
+                        BASE_SIZE="\"$(du -h "${base-db}" | cut -f1)\""
+                        BASE_EXISTS="true"
+                      fi
+                      ENRICHED_SIZE="null"; ENRICHED_EXISTS="false"; ENRICHED_STALE="false"
+                      if [ -f "${enriched-db}" ]; then
+                        ENRICHED_SIZE="\"$(du -h "${enriched-db}" | cut -f1)\""
+                        ENRICHED_EXISTS="true"
+                        if [ "${base-db}" -nt "${enriched-db}" ]; then
+                          ENRICHED_STALE="true"
+                        fi
+                      fi
+                      ${jq} -cn --arg bp "${base-db}" --argjson bs "$BASE_SIZE" --argjson be "$BASE_EXISTS" \
+                              --arg ep "${enriched-db}" --argjson es "$ENRICHED_SIZE" --argjson ee "$ENRICHED_EXISTS" --argjson est "$ENRICHED_STALE" \
+                        '{type:"database_file",path:$bp,size:$bs,exists:$be}'
+                      ${jq} -cn --arg bp "${base-db}" --argjson bs "$BASE_SIZE" --argjson be "$BASE_EXISTS" \
+                              --arg ep "${enriched-db}" --argjson es "$ENRICHED_SIZE" --argjson ee "$ENRICHED_EXISTS" --argjson est "$ENRICHED_STALE" \
+                        '{type:"database_file",path:$ep,size:$es,exists:$ee,stale:$est}'
+                      # Table counts as NDJSON
+                      printf '.mode json\n%s\n' \
+                        "SELECT 'packages' AS tbl, count(*) AS rows FROM packages
+                         UNION ALL SELECT 'package_maintainers', count(*) FROM package_maintainers
+                         UNION ALL SELECT 'package_platforms', count(*) FROM package_platforms;" \
+                        | ${duckdb} -readonly "$DB" | ${jq} -c '.[]'
+                      if ${duckdb} -readonly "$DB" -c "SELECT 1 FROM dependency_edges LIMIT 1" >/dev/null 2>&1; then
+                        printf '.mode json\n%s\n' \
+                          "SELECT 'dependency_edges' AS tbl, count(*) AS rows FROM dependency_edges
+                           UNION ALL SELECT 'package_passthru', count(*) FROM package_passthru;" \
+                          | ${duckdb} -readonly "$DB" | ${jq} -c '.[]'
+                      fi
+                    elif [ "$CSV" = 1 ]; then
+                      echo "base_db,${base-db}"
+                      echo "enriched_db,${enriched-db}"
+                      printf '.mode csv\n%s\n' \
+                        "SELECT 'packages' AS tbl, count(*) AS rows FROM packages
+                         UNION ALL SELECT 'package_maintainers', count(*) FROM package_maintainers
+                         UNION ALL SELECT 'package_platforms', count(*) FROM package_platforms;" \
+                        | ${duckdb} -readonly "$DB"
+                      if ${duckdb} -readonly "$DB" -c "SELECT 1 FROM dependency_edges LIMIT 1" >/dev/null 2>&1; then
+                        printf '.mode csv\n%s\n' \
+                          "SELECT 'dependency_edges' AS tbl, count(*) AS rows FROM dependency_edges
+                           UNION ALL SELECT 'package_passthru', count(*) FROM package_passthru;" \
+                          | ${duckdb} -readonly "$DB"
+                      else
+                        echo "(enriched tables not available)"
+                      fi
+                    else
+                      echo "=== Database files ==="
+                      printf "  Base DB:     %s\n" "${base-db}"
+                      if [ -f "${base-db}" ]; then
+                        SIZE=$(du -h "${base-db}" | cut -f1)
+                        printf "               %s\n" "$SIZE"
+                      else
+                        printf "               (not found)\n"
+                      fi
+                      printf "  Enriched DB: %s\n" "${enriched-db}"
+                      if [ -f "${enriched-db}" ]; then
+                        SIZE=$(du -h "${enriched-db}" | cut -f1)
+                        printf "               %s\n" "$SIZE"
+                        if [ "${base-db}" -nt "${enriched-db}" ]; then
+                          printf "               (stale — base DB is newer)\n"
+                        fi
+                      else
+                        printf "               (not found)\n"
+                      fi
+                      echo ""
+                      echo "=== Table row counts ==="
+                      ${duckdb} -readonly "$DB" <<'STATS_SQL'
+.mode table
+                        SELECT 'packages' AS tbl, count(*) AS rows FROM packages
+                        UNION ALL
+                        SELECT 'package_maintainers', count(*) FROM package_maintainers
+                        UNION ALL
+                        SELECT 'package_platforms', count(*) FROM package_platforms;
+STATS_SQL
+                      if ${duckdb} -readonly "$DB" -c "SELECT 1 FROM dependency_edges LIMIT 1" >/dev/null 2>&1; then
+                        ${duckdb} -readonly "$DB" <<'STATS_SQL'
+.mode table
+                          SELECT 'dependency_edges' AS tbl, count(*) AS rows FROM dependency_edges
+                          UNION ALL
+                          SELECT 'package_passthru', count(*) FROM package_passthru;
+STATS_SQL
+                      else
+                        echo "(enriched tables not available)"
+                      fi
+                    fi
+                    ;;
+
                   db)
                     exec ${duckdb} -readonly "$DB" "''${ARGS[@]:1}"
                     ;;
@@ -585,12 +694,14 @@ STATS_SQL
                 # Available commands
                 echo "Commands (base):"
                 echo "  search <term>        Search packages by name/description"
+                echo "  maintainers <attr>   Maintainers of a package"
                 echo "  maintainer <github>  Packages by maintainer"
                 echo "  top-maintainers      Top maintainers by package count"
                 echo "  orphans              Packages with no maintainers"
                 echo "  broken               Packages marked as broken"
                 echo "  unfree               Packages marked as unfree"
                 echo "  platforms <attr>     Supported platforms for a package"
+                echo "  stats                Database sizes and row counts"
                 echo "  db [args...]         Raw DuckDB session"
                 echo ""
                 echo "Commands (requires enrich):"
