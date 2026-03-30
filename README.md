@@ -13,11 +13,13 @@ with simple CLI commands or raw SQL.
 ## Quick start
 
 ```bash
-nix develop
+nix develop --option sandbox relaxed
 ```
 
-> **Note:** Building the database requires `sandbox = relaxed` in your
-> `nix.conf` because the evaluation step needs store access.
+The database build step uses `nix-env` to evaluate all of nixpkgs, which
+requires store access from inside the build sandbox. The `--option sandbox
+relaxed` flag allows this. If you already have `sandbox = relaxed` in your
+`nix.conf`, you can just run `nix develop`.
 
 Once inside the dev shell, run `nix-facts help` to see available commands.
 
