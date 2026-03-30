@@ -346,6 +346,7 @@
                                   echo ""
                                   echo "Commands:"
                                   echo "  search <term>         Search packages by name/description"
+                                  echo "  info <attr>           Show all metadata for a package"
                                   echo "  maintainers <attr>    Maintainers of a package"
                                   echo "  maintainer <github>   Packages by maintainer GitHub handle"
                                   echo "  top-maintainers       Top maintainers by package count"
@@ -379,11 +380,27 @@
                                     else
                                       DESCFN="substr(description, 1, 80) AS description"; LIMIT="LIMIT 50"
                                     fi
-                                    query "SELECT attr, version, $DESCFN
+                                    query "SELECT attr AS package, version, $DESCFN
                                 FROM packages
                                 WHERE attr ILIKE '%' || '$ARG' || '%'
                                    OR description ILIKE '%' || '$ARG' || '%'
                                 ORDER BY attr $LIMIT;"
+                                    ;;
+
+                                  info)
+                                    ARG="''${ARGS[1]:-}"
+                                    if [ -z "$ARG" ]; then echo "Usage: nix-facts info <attr>" >&2; exit 1; fi
+                                    ARG=$(printf '%s' "$ARG" | sed "s/'/'''/g")
+                                    query "SELECT p.attr AS package, p.name, p.version, p.description, p.homepage,
+                                       p.license, p.main_program, p.broken, p.unfree,
+                                       CASE WHEN p.position IS NOT NULL THEN
+                                         regexp_extract(p.position, '.*/nixpkgs/(.*)$', 1)
+                                       ELSE NULL END AS source,
+                                       p.drv_path,
+                                       (SELECT string_agg(pm.maintainer_github, ', ' ORDER BY pm.maintainer_github)
+                                        FROM package_maintainers pm WHERE pm.attr = p.attr) AS maintainers
+                                FROM packages p
+                                WHERE p.attr ILIKE '$ARG';"
                                     ;;
 
                                   maintainers)
@@ -405,7 +422,7 @@
                                     else
                                       DESCFN="substr(p.description, 1, 60) AS description"; LIMIT="LIMIT 200"
                                     fi
-                                    query "SELECT pm.attr, p.version, $DESCFN
+                                    query "SELECT pm.attr AS package, p.version, $DESCFN
                                 FROM package_maintainers pm
                                 JOIN packages p ON pm.attr = p.attr
                                 WHERE pm.maintainer_github ILIKE '$ARG'
@@ -427,7 +444,7 @@
                                     else
                                       DESCFN="substr(p.description, 1, 60) AS description"; LIMIT="LIMIT 100"
                                     fi
-                                    query "SELECT p.attr, p.version, $DESCFN
+                                    query "SELECT p.attr AS package, p.version, $DESCFN
                                 FROM packages p
                                 LEFT JOIN package_maintainers pm ON p.attr = pm.attr
                                 WHERE pm.attr IS NULL
@@ -440,7 +457,7 @@
                                     else
                                       DESCFN="substr(description, 1, 80) AS description"; LIMIT="LIMIT 100"
                                     fi
-                                    query "SELECT attr, version, $DESCFN
+                                    query "SELECT attr AS package, version, $DESCFN
                                 FROM packages
                                 WHERE broken = true
                                 ORDER BY attr $LIMIT;"
@@ -452,7 +469,7 @@
                                     else
                                       DESCFN="substr(description, 1, 80) AS description"; LIMIT="LIMIT 100"
                                     fi
-                                    query "SELECT attr, version, license, $DESCFN
+                                    query "SELECT attr AS package, version, license, $DESCFN
                                 FROM packages
                                 WHERE unfree = true
                                 ORDER BY attr $LIMIT;"
@@ -475,7 +492,7 @@
                                     else
                                       DESCFN="substr(p.description, 1, 80) AS description"; LIMIT="LIMIT 100"
                                     fi
-                                    query "SELECT p.attr, p.version, $DESCFN
+                                    query "SELECT p.attr AS package, p.version, $DESCFN
                                 FROM packages p
                                 JOIN package_passthru pt ON p.attr = pt.attr
                                 WHERE pt.has_tests = false
@@ -490,7 +507,7 @@
                                     else
                                       DESCFN="substr(p.description, 1, 80) AS description"; LIMIT="LIMIT 100"
                                     fi
-                                    query "SELECT p.attr, p.version, $DESCFN
+                                    query "SELECT p.attr AS package, p.version, $DESCFN
                                 FROM packages p
                                 JOIN package_passthru pt ON p.attr = pt.attr
                                 WHERE pt.has_update_script = false
@@ -514,7 +531,7 @@
                                   SELECT e.input_drv FROM dep_tree d
                                   JOIN dependency_edges e ON d.drv_path = e.drv_path
                                 )
-                                SELECT DISTINCT p.attr, p.version, $DESCFN
+                                SELECT DISTINCT p.attr AS package, p.version, $DESCFN
                                 FROM dep_tree d JOIN packages p ON d.drv_path = p.drv_path
                                 WHERE p.attr NOT ILIKE '$ARG'
                                 ORDER BY p.attr $LIMIT;"
@@ -549,7 +566,7 @@
                                   GROUP BY drv_path
                                   HAVING min(depth) > 0
                                 )
-                                SELECT ds.depth, p.attr,
+                                SELECT ds.depth, p.attr AS package,
                                   (SELECT min(pp.attr) FROM dependency_edges e
                                    JOIN dep_summary pds ON e.drv_path = pds.drv_path
                                    JOIN packages pp ON e.drv_path = pp.drv_path
@@ -708,6 +725,7 @@
                 # Available commands
                 echo "Commands (base):"
                 echo "  search <term>        Search packages by name/description"
+                echo "  info <attr>          Show all metadata for a package"
                 echo "  maintainers <attr>   Maintainers of a package"
                 echo "  maintainer <github>  Packages by maintainer"
                 echo "  top-maintainers      Top maintainers by package count"

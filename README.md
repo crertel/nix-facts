@@ -32,6 +32,7 @@ Once inside the dev shell, run `nix-facts help` to see available commands.
 | Command | Description |
 |---|---|
 | `search <term>` | Search packages by name or description |
+| `info <attr>` | Show all metadata for a single package |
 | `maintainers <attr>` | List maintainers of a package |
 | `maintainer <github>` | List packages by maintainer GitHub handle |
 | `top-maintainers` | Top maintainers by package count |
