@@ -33,12 +33,14 @@
             cp -a ${nixpkgs} "$WORK/nixpkgs"
 
             mkdir -p $out
-            nix-env -f "$WORK/nixpkgs" -qaP --meta --json > $out/meta.json
+            NIXPKGS_ALLOW_UNFREE=1 NIXPKGS_ALLOW_BROKEN=1 \
+              nix-env -f "$WORK/nixpkgs" -qaP --meta --drv-path --json > $out/meta.json
           '';
 
-          # Stage 2: Convert the JSON dump into a DuckDB database with two tables:
+          # Stage 2: Convert the JSON dump into a DuckDB database with three tables:
           #   packages            — one row per attribute path
           #   package_maintainers — unnested (attr, maintainer) junction table
+          #   package_platforms   — unnested (attr, platform) junction table
           meta-db = pkgs.runCommand "nixpkgs-meta-db" {
             nativeBuildInputs = [ pkgs.duckdb pkgs.jq ];
           } ''
@@ -50,12 +52,14 @@
               name: .value.name,
               pname: (.value.pname // null),
               version: (.value.version // null),
+              drv_path: (.value.drvPath // null),
               description: (.value.meta.description // null),
               homepage: (
                 (.value.meta.homepage // null) |
                 if type == "array" then .[0] // null else . end
               ),
               position: (.value.meta.position // null),
+              main_program: (.value.meta.mainProgram // null),
               broken: (.value.meta.broken // false),
               unfree: (.value.meta.unfree // false),
               license: (
@@ -81,6 +85,14 @@
                 maintainer_email:  (.email // null)
               }' ${meta-json}/meta.json > /tmp/maintainers.ndjson
 
+            echo ":: Converting to NDJSON (platforms)..."
+            jq -c 'to_entries[] |
+              .key as $attr |
+              (.value.meta.platforms // [])[] |
+              if type == "string" then
+                {attr: $attr, platform: .}
+              else empty end' ${meta-json}/meta.json > /tmp/platforms.ndjson
+
             echo ":: Loading into DuckDB..."
             duckdb $out/meta.db <<'SQL'
               CREATE TABLE packages AS
@@ -89,15 +101,25 @@
               CREATE TABLE package_maintainers AS
               SELECT * FROM read_ndjson_auto('/tmp/maintainers.ndjson');
 
+              CREATE TABLE package_platforms AS
+              SELECT * FROM read_ndjson_auto('/tmp/platforms.ndjson');
+
               CREATE INDEX idx_maintainer_github
               ON package_maintainers (maintainer_github);
+
+              CREATE INDEX idx_platform
+              ON package_platforms (platform);
+
+              CREATE INDEX idx_pkg_drv ON packages (drv_path);
 SQL
 
             echo ":: Done."
             duckdb -readonly $out/meta.db <<'SQL'
               SELECT 'packages' AS tbl, count(*) AS rows FROM packages
               UNION ALL
-              SELECT 'maintainers', count(*) FROM package_maintainers;
+              SELECT 'maintainers', count(*) FROM package_maintainers
+              UNION ALL
+              SELECT 'platforms', count(*) FROM package_platforms;
 SQL
           '';
         in
@@ -111,16 +133,160 @@ SQL
         let
           pkgs = nixpkgs.legacyPackages.${system};
           meta-db = self.packages.${system}.meta-db;
-          db = "${meta-db}/meta.db";
+          meta-json = self.packages.${system}.meta-json;
+          base-db = "${meta-db}/meta.db";
+          enriched-db = "$HOME/.cache/nix-facts/meta.db";
           duckdb = "${pkgs.duckdb}/bin/duckdb";
+          jq = "${pkgs.jq}/bin/jq";
         in
         {
           default = pkgs.mkShell {
             packages = [
               pkgs.duckdb
+              pkgs.jq
+
+              # Enrich the base DB with dependency edges (runs outside Nix build
+              # so it has full daemon access for nix derivation show)
+              (pkgs.writeShellScriptBin "nix-facts-enrich" ''
+                set -euo pipefail
+
+                # Step 1: Extract attr paths from meta.json and force-instantiate
+                # all derivations so their .drv files exist in the store.
+                echo ":: Extracting attr paths from meta.json..."
+                ${jq} 'keys' ${meta-json}/meta.json > /tmp/nf_attrs.json
+                TOTAL=$(${jq} 'length' /tmp/nf_attrs.json)
+                echo "  Found $TOTAL package attribute paths"
+
+                echo ":: Instantiating all derivations (evaluates nixpkgs, may take several minutes)..."
+                NIXPKGS_ALLOW_UNFREE=1 NIXPKGS_ALLOW_BROKEN=1 \
+                nix-instantiate --expr '
+                  let
+                    pkgs = import ${nixpkgs} { config = { allowUnfree = true; allowBroken = true; }; };
+                    lib = pkgs.lib;
+                    getByPath = path:
+                      lib.attrByPath (lib.splitString "." path) null pkgs;
+                    paths = builtins.fromJSON (builtins.readFile /tmp/nf_attrs.json);
+                    tryGet = p:
+                      let v = builtins.tryEval (
+                        let pkg = getByPath p;
+                        in if pkg != null && pkg ? drvPath
+                           then builtins.seq pkg.drvPath pkg
+                           else null
+                      );
+                      in if v.success && v.value != null then v.value else null;
+                  in builtins.filter (x: x != null) (map tryGet paths)
+                ' > /tmp/nf_instantiated.txt 2>&1 || true
+                INSTANTIATED=$(grep -c '/nix/store/.*\.drv' /tmp/nf_instantiated.txt || echo 0)
+                echo "  Instantiated $INSTANTIATED derivations"
+
+                # Step 2: Extract drv paths and filter to those now in the store
+                echo ":: Extracting drv paths from meta.json..."
+                ${jq} -r 'to_entries[].value.drvPath // empty' ${meta-json}/meta.json \
+                  | sort -u > /tmp/nf_all_drvs.txt
+                DRVTOTAL=$(wc -l < /tmp/nf_all_drvs.txt)
+                echo "  Found $DRVTOTAL unique derivation paths"
+
+                : > /tmp/nf_valid_drvs.txt
+                while IFS= read -r drv; do
+                  [ -e "$drv" ] && echo "$drv" >> /tmp/nf_valid_drvs.txt
+                done < /tmp/nf_all_drvs.txt
+                VALID=$(wc -l < /tmp/nf_valid_drvs.txt)
+                echo "  $VALID / $DRVTOTAL derivations exist in store"
+
+                if [ "$VALID" -eq 0 ]; then
+                  echo "ERROR: No derivation files found in store." >&2
+                  rm -f /tmp/nf_attrs.json /tmp/nf_all_drvs.txt /tmp/nf_valid_drvs.txt
+                  exit 1
+                fi
+
+                # Step 3: Extract dependency edges
+                echo ":: Extracting dependency edges via nix derivation show..."
+                cat /tmp/nf_valid_drvs.txt \
+                  | xargs -n 2000 nix derivation show 2>/dev/null \
+                  | ${jq} -c 'to_entries[] | .key as $drv | (.value.inputDrvs // {}) | to_entries[] |
+                      {drv_path: $drv, input_drv: .key}' > /tmp/nf_edges.ndjson || true
+                EDGES=$(wc -l < /tmp/nf_edges.ndjson)
+                echo "  Generated $EDGES dependency edges"
+
+                if [ "$EDGES" -eq 0 ]; then
+                  echo "ERROR: Failed to extract any edges." >&2
+                  rm -f /tmp/nf_attrs.json /tmp/nf_instantiated.txt /tmp/nf_all_drvs.txt /tmp/nf_valid_drvs.txt /tmp/nf_edges.ndjson
+                  exit 1
+                fi
+
+                # Step 4: Extract passthru metadata (tests, updateScript)
+                echo ":: Extracting passthru metadata (has_tests, has_update_script)..."
+                NIXPKGS_ALLOW_UNFREE=1 NIXPKGS_ALLOW_BROKEN=1 \
+                nix-instantiate --eval --strict --json --expr '
+                  let
+                    pkgs = import ${nixpkgs} { config = { allowUnfree = true; allowBroken = true; }; };
+                    lib = pkgs.lib;
+                    getByPath = path:
+                      lib.attrByPath (lib.splitString "." path) null pkgs;
+                    paths = builtins.fromJSON (builtins.readFile /tmp/nf_attrs.json);
+                    check = p:
+                      let
+                        pkg = builtins.tryEval (getByPath p);
+                        hasTests = builtins.tryEval (
+                          pkg.value ? passthru &&
+                          pkg.value.passthru ? tests &&
+                          builtins.length (builtins.attrNames pkg.value.passthru.tests) > 0
+                        );
+                        hasUpdate = builtins.tryEval (
+                          pkg.value ? passthru &&
+                          pkg.value.passthru ? updateScript
+                        );
+                      in if pkg.success && pkg.value != null then {
+                        attr = p;
+                        has_tests = if hasTests.success then hasTests.value else false;
+                        has_update_script = if hasUpdate.success then hasUpdate.value else false;
+                      } else null;
+                  in builtins.filter (x: x != null) (map check paths)
+                ' | ${jq} -c '.[]' > /tmp/nf_passthru.ndjson || true
+                PASSTHRU=$(wc -l < /tmp/nf_passthru.ndjson)
+                echo "  Extracted passthru info for $PASSTHRU packages"
+
+                # Step 5: Build enriched database
+                echo ":: Building enriched database..."
+                mkdir -p "$(dirname "${enriched-db}")"
+                cp "${base-db}" "${enriched-db}"
+                chmod u+w "${enriched-db}"
+
+                ${duckdb} "${enriched-db}" <<ENRICH_SQL
+                  CREATE TABLE dependency_edges AS
+                  SELECT * FROM read_ndjson_auto('/tmp/nf_edges.ndjson');
+
+                  CREATE TABLE package_passthru AS
+                  SELECT * FROM read_ndjson_auto('/tmp/nf_passthru.ndjson');
+
+                  CREATE INDEX idx_dep_drv ON dependency_edges (drv_path);
+                  CREATE INDEX idx_dep_input ON dependency_edges (input_drv);
+                  CREATE INDEX idx_passthru_attr ON package_passthru (attr);
+ENRICH_SQL
+
+                echo ":: Done. Enriched database at ${enriched-db}"
+                ${duckdb} -readonly "${enriched-db}" <<'STATS_SQL'
+                  SELECT 'packages' AS tbl, count(*) AS rows FROM packages
+                  UNION ALL
+                  SELECT 'maintainers', count(*) FROM package_maintainers
+                  UNION ALL
+                  SELECT 'dep_edges', count(*) FROM dependency_edges
+                  UNION ALL
+                  SELECT 'passthru', count(*) FROM package_passthru;
+STATS_SQL
+
+                rm -f /tmp/nf_attrs.json /tmp/nf_instantiated.txt /tmp/nf_all_drvs.txt /tmp/nf_valid_drvs.txt /tmp/nf_edges.ndjson /tmp/nf_passthru.ndjson
+              '')
 
               (pkgs.writeShellScriptBin "nix-facts" ''
                 set -euo pipefail
+
+                # Use enriched DB if available, otherwise base DB
+                if [ -f "${enriched-db}" ]; then
+                  DB="${enriched-db}"
+                else
+                  DB="${base-db}"
+                fi
 
                 ALL=0
                 CSV=0
@@ -137,9 +303,23 @@ SQL
 
                 query() {
                   if [ "$CSV" = 1 ]; then
-                    printf '.mode csv\n%s\n' "$1" | ${duckdb} -readonly "${db}"
+                    printf '.mode csv\n%s\n' "$1" | ${duckdb} -readonly "$DB"
                   else
-                    printf '.maxrows 100000\n%s\n' "$1" | ${duckdb} -readonly "${db}"
+                    printf '.maxrows 100000\n%s\n' "$1" | ${duckdb} -readonly "$DB"
+                  fi
+                }
+
+                require_edges() {
+                  if ! ${duckdb} -readonly "$DB" -c "SELECT 1 FROM dependency_edges LIMIT 1" >/dev/null 2>&1; then
+                    echo "ERROR: Dependency edges not available. Run 'nix-facts-enrich' first." >&2
+                    exit 1
+                  fi
+                }
+
+                require_passthru() {
+                  if ! ${duckdb} -readonly "$DB" -c "SELECT 1 FROM package_passthru LIMIT 1" >/dev/null 2>&1; then
+                    echo "ERROR: Passthru metadata not available. Run 'nix-facts-enrich' first." >&2
+                    exit 1
                   fi
                 }
 
@@ -151,11 +331,21 @@ SQL
                   echo "  maintainer <github>   Packages by maintainer GitHub handle"
                   echo "  top-maintainers       Top maintainers by package count"
                   echo "  orphans               Packages with no maintainers"
+                  echo "  broken                Packages marked as broken"
+                  echo "  unfree                Packages marked as unfree"
+                  echo "  platforms <attr>      Supported platforms for a package"
+                  echo "  no-tests              Packages without tests (needs enrich)"
+                  echo "  no-update-script      Packages without update scripts (needs enrich)"
+                  echo "  deps <attr>           Transitive dependencies (needs enrich)"
+                  echo "  direct-deps <attr> [depth]  Dependencies to given depth (needs enrich)"
+                  echo "  dep-maintainers <attr> Maintainers of transitive deps (needs enrich)"
                   echo "  db [args...]          Raw DuckDB session"
                   echo ""
                   echo "Options:"
                   echo "  --all   Show full results (no row limits or truncation)"
                   echo "  --csv   Output as CSV"
+                  echo ""
+                  echo "Run 'nix-facts-enrich' to enable deps/dep-maintainers commands."
                 }
 
                 case "$CMD" in
@@ -213,8 +403,158 @@ SQL
                 ORDER BY p.attr $LIMIT;"
                     ;;
 
+                  broken)
+                    if [ "$ALL" = 1 ]; then
+                      DESCFN="description"; LIMIT=""
+                    else
+                      DESCFN="substr(description, 1, 80) AS description"; LIMIT="LIMIT 100"
+                    fi
+                    query "SELECT attr, version, $DESCFN
+                FROM packages
+                WHERE broken = true
+                ORDER BY attr $LIMIT;"
+                    ;;
+
+                  unfree)
+                    if [ "$ALL" = 1 ]; then
+                      DESCFN="description"; LIMIT=""
+                    else
+                      DESCFN="substr(description, 1, 80) AS description"; LIMIT="LIMIT 100"
+                    fi
+                    query "SELECT attr, version, license, $DESCFN
+                FROM packages
+                WHERE unfree = true
+                ORDER BY attr $LIMIT;"
+                    ;;
+
+                  platforms)
+                    ARG="''${ARGS[1]:-}"
+                    if [ -z "$ARG" ]; then echo "Usage: nix-facts platforms <attr>" >&2; exit 1; fi
+                    ARG=$(printf '%s' "$ARG" | sed "s/'/'''/g")
+                    query "SELECT pp.platform
+                FROM package_platforms pp
+                WHERE pp.attr ILIKE '$ARG'
+                ORDER BY pp.platform;"
+                    ;;
+
+                  no-tests)
+                    require_passthru
+                    if [ "$ALL" = 1 ]; then
+                      DESCFN="p.description"; LIMIT=""
+                    else
+                      DESCFN="substr(p.description, 1, 80) AS description"; LIMIT="LIMIT 100"
+                    fi
+                    query "SELECT p.attr, p.version, $DESCFN
+                FROM packages p
+                JOIN package_passthru pt ON p.attr = pt.attr
+                WHERE pt.has_tests = false
+                  AND p.broken = false
+                ORDER BY p.attr $LIMIT;"
+                    ;;
+
+                  no-update-script)
+                    require_passthru
+                    if [ "$ALL" = 1 ]; then
+                      DESCFN="p.description"; LIMIT=""
+                    else
+                      DESCFN="substr(p.description, 1, 80) AS description"; LIMIT="LIMIT 100"
+                    fi
+                    query "SELECT p.attr, p.version, $DESCFN
+                FROM packages p
+                JOIN package_passthru pt ON p.attr = pt.attr
+                WHERE pt.has_update_script = false
+                  AND p.broken = false
+                ORDER BY p.attr $LIMIT;"
+                    ;;
+
+                  deps)
+                    require_edges
+                    ARG="''${ARGS[1]:-}"
+                    if [ -z "$ARG" ]; then echo "Usage: nix-facts deps <attr>" >&2; exit 1; fi
+                    ARG=$(printf '%s' "$ARG" | sed "s/'/'''/g")
+                    if [ "$ALL" = 1 ]; then
+                      DESCFN="description"; LIMIT=""
+                    else
+                      DESCFN="substr(description, 1, 80) AS description"; LIMIT="LIMIT 50"
+                    fi
+                    query "WITH RECURSIVE dep_tree AS (
+                  SELECT drv_path FROM packages WHERE attr ILIKE '$ARG'
+                  UNION
+                  SELECT e.input_drv FROM dep_tree d
+                  JOIN dependency_edges e ON d.drv_path = e.drv_path
+                )
+                SELECT DISTINCT p.attr, p.version, $DESCFN
+                FROM dep_tree d JOIN packages p ON d.drv_path = p.drv_path
+                WHERE p.attr NOT ILIKE '$ARG'
+                ORDER BY p.attr $LIMIT;"
+                    ;;
+
+                  direct-deps)
+                    require_edges
+                    ARG="''${ARGS[1]:-}"
+                    if [ -z "$ARG" ]; then echo "Usage: nix-facts direct-deps <attr> [depth]" >&2; exit 1; fi
+                    ARG=$(printf '%s' "$ARG" | sed "s/'/'''/g")
+                    DEPTH="''${ARGS[2]:-1}"
+                    if ! echo "$DEPTH" | grep -qE '^[0-9]+$'; then
+                      echo "ERROR: depth must be a positive integer" >&2; exit 1
+                    fi
+                    if [ "$ALL" = 1 ]; then
+                      DESCFN="p.description"; LIMIT=""
+                    else
+                      DESCFN="substr(p.description, 1, 80) AS description"; LIMIT="LIMIT 200"
+                    fi
+                    query "WITH RECURSIVE dep_tree AS (
+                  SELECT drv_path, 0 AS depth
+                  FROM packages WHERE attr ILIKE '$ARG'
+                  UNION
+                  SELECT e.input_drv, d.depth + 1
+                  FROM dep_tree d
+                  JOIN dependency_edges e ON d.drv_path = e.drv_path
+                  WHERE d.depth < $DEPTH
+                ),
+                dep_summary AS (
+                  SELECT drv_path, min(depth) AS depth
+                  FROM dep_tree
+                  GROUP BY drv_path
+                  HAVING min(depth) > 0
+                )
+                SELECT ds.depth, p.attr,
+                  (SELECT min(pp.attr) FROM dependency_edges e
+                   JOIN dep_summary pds ON e.drv_path = pds.drv_path
+                   JOIN packages pp ON e.drv_path = pp.drv_path
+                   WHERE e.input_drv = ds.drv_path
+                     AND pds.depth = ds.depth - 1
+                  ) AS required_by,
+                  p.version, $DESCFN
+                FROM dep_summary ds
+                JOIN packages p ON ds.drv_path = p.drv_path
+                ORDER BY ds.depth, p.attr $LIMIT;"
+                    ;;
+
+                  dep-maintainers)
+                    require_edges
+                    ARG="''${ARGS[1]:-}"
+                    if [ -z "$ARG" ]; then echo "Usage: nix-facts dep-maintainers <attr>" >&2; exit 1; fi
+                    ARG=$(printf '%s' "$ARG" | sed "s/'/'''/g")
+                    if [ "$ALL" = 1 ]; then LIMIT=""; else LIMIT="LIMIT 50"; fi
+                    query "WITH RECURSIVE dep_tree AS (
+                  SELECT drv_path FROM packages WHERE attr ILIKE '$ARG'
+                  UNION
+                  SELECT e.input_drv FROM dep_tree d
+                  JOIN dependency_edges e ON d.drv_path = e.drv_path
+                )
+                SELECT pm.maintainer_github, pm.maintainer_name,
+                       count(DISTINCT p.attr) AS package_count
+                FROM dep_tree d
+                JOIN packages p ON d.drv_path = p.drv_path
+                JOIN package_maintainers pm ON p.attr = pm.attr
+                WHERE pm.maintainer_github IS NOT NULL
+                GROUP BY pm.maintainer_github, pm.maintainer_name
+                ORDER BY package_count DESC $LIMIT;"
+                    ;;
+
                   db)
-                    exec ${duckdb} -readonly "${db}" "''${ARGS[@]:1}"
+                    exec ${duckdb} -readonly "$DB" "''${ARGS[@]:1}"
                     ;;
 
                   help|--help|-h)
@@ -233,6 +573,11 @@ SQL
             shellHook = ''
               echo "nix-facts dev shell"
               echo "Run 'nix-facts help' for usage."
+              if [ -f "${enriched-db}" ]; then
+                echo "Using enriched DB (with dependency edges)"
+              else
+                echo "Run 'nix-facts-enrich' to enable deps/dep-maintainers commands."
+              fi
             '';
           };
         }
