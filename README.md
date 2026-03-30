@@ -1,0 +1,90 @@
+# nix-facts
+
+> [!NOTE]
+> **This project is built in collaboration with [Claude](https://claude.ai), Anthropic's AI assistant.**
+> Large portions of the code, documentation, and tooling were written by or with Claude.
+
+Queryable DuckDB database of nixpkgs package metadata.
+
+Evaluates all of nixpkgs, extracts package metadata (names, versions, licenses,
+maintainers, platforms), and loads it into a local DuckDB database you can query
+with simple CLI commands or raw SQL.
+
+## Quick start
+
+```bash
+nix develop
+```
+
+> **Note:** Building the database requires `sandbox = relaxed` in your
+> `nix.conf` because the evaluation step needs store access.
+
+Once inside the dev shell, run `nix-facts help` to see available commands.
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `search <term>` | Search packages by name or description |
+| `maintainers <attr>` | List maintainers of a package |
+| `maintainer <github>` | List packages by maintainer GitHub handle |
+| `top-maintainers` | Top maintainers by package count |
+| `orphans` | Packages with no maintainers |
+| `broken` | Packages marked as broken |
+| `unfree` | Packages marked as unfree |
+| `platforms <attr>` | Supported platforms for a package |
+| `stats` | Database sizes and row counts |
+| `db [args...]` | Open a raw DuckDB session |
+
+### Commands requiring enrichment
+
+These commands require running `nix-facts-enrich` first (see below):
+
+| Command | Description |
+|---|---|
+| `deps <attr>` | Transitive dependencies of a package |
+| `direct-deps <attr> [depth]` | Dependencies to a given depth |
+| `dep-maintainers <attr>` | Maintainers across transitive deps |
+| `no-tests` | Packages without tests |
+| `no-update-script` | Packages without update scripts |
+
+## Output formats
+
+All query commands accept these flags:
+
+- `--csv` — Output as CSV
+- `--ndjson` — Output as newline-delimited JSON (one object per line)
+- `--all` — Show full results with no row limits or description truncation
+
+Without flags, output is rendered as a table.
+
+## Enrichment
+
+The base database contains package metadata only. To unlock dependency and
+passthru queries, run the enrichment pipeline:
+
+```bash
+nix-facts-enrich
+```
+
+This evaluates nixpkgs derivations to extract dependency edges and passthru
+metadata (tests, update scripts). It takes several minutes and requires a
+working Nix daemon. The enriched database is stored at
+`~/.cache/nix-facts/meta.db`.
+
+## Contributing
+
+1. Fork the repo and create a feature branch
+2. Make your changes
+3. Run `nix fmt` before submitting
+4. Open a pull request against `master`
+
+We use squash merges. Please keep PRs focused on a single change.
+
+### AI contributions
+
+AI-generated contributions are welcome. All contributions (AI or otherwise) must
+follow the same rules: code must work, pass CI, and follow project conventions.
+AI involvement must be disclosed — either directly in the PR description or by
+adding the AI as a co-author on commits (e.g.,
+`Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>`).

@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix fmt -- --check ./flake.nix
+
+  single-commit:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check PR has exactly one commit
+        run: |
+          COMMIT_COUNT=$(git rev-list --count origin/${{ github.base_ref }}..HEAD)
+          echo "PR has $COMMIT_COUNT commit(s)"
+          if [ "$COMMIT_COUNT" -ne 1 ]; then
+            echo "::error::PR must contain exactly one commit (has $COMMIT_COUNT). Please squash before submitting."
+            exit 1
+          fi
+
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix flake check
+      - run: nix flake show
