@@ -83,7 +83,8 @@
                                   .spdxId // .shortName // .fullName // "unknown"
                                 elif type == "string" then .
                                 else null end
-                              )
+                              ),
+                              maintainers: [(.value.meta.maintainers // [])[] | .github // empty]
                             }' ${meta-json}/meta.json > /tmp/packages.ndjson
 
                             echo ":: Converting to NDJSON (maintainers)..."
@@ -396,9 +397,7 @@
                                        CASE WHEN p.position IS NOT NULL THEN
                                          regexp_extract(p.position, '.*/nixpkgs/(.*)$', 1)
                                        ELSE NULL END AS source,
-                                       p.drv_path,
-                                       (SELECT string_agg(pm.maintainer_github, ', ' ORDER BY pm.maintainer_github)
-                                        FROM package_maintainers pm WHERE pm.attr = p.attr) AS maintainers
+                                       p.drv_path, to_json(p.maintainers) AS maintainers
                                 FROM packages p
                                 WHERE p.attr ILIKE '$ARG';"
                                     ;;
