@@ -40,6 +40,7 @@ Once inside the dev shell, run `nix-facts help` to see available commands.
 | `broken` | Packages marked as broken |
 | `unfree` | Packages marked as unfree |
 | `platforms <attr>` | Supported platforms for a package |
+| `audit [target]` | Health audit of a runtime closure |
 | `stats` | Database sizes and row counts |
 | `db [args...]` | Open a raw DuckDB session |
 
@@ -55,6 +56,22 @@ These commands require running `nix-facts-enrich` first (see below):
 | `no-tests` | Packages without tests |
 | `no-update-script` | Packages without update scripts |
 
+### Closure audit
+
+The `audit` command cross-references a Nix closure's runtime dependencies against
+the nix-facts database, reporting maintainer coverage, test coverage, and update
+script coverage.
+
+```bash
+nix-facts audit                              # current running NixOS system
+nix-facts audit .#nixosConfigurations.myhost  # flake reference
+nix-facts audit ./shell.nix                  # .nix file
+nix-facts audit /nix/store/...-system        # store path directly
+```
+
+Without enrichment, only maintainer coverage is shown. Run `nix-facts-enrich` to
+enable test and update script metrics.
+
 ## Output formats
 
 All query commands accept these flags:
@@ -62,6 +79,7 @@ All query commands accept these flags:
 - `--csv` — Output as CSV
 - `--ndjson` — Output as newline-delimited JSON (one object per line)
 - `--all` — Show full results with no row limits or description truncation
+- `--quiet` / `-q` — Suppress progress messages on stderr
 
 Without flags, output is rendered as a table.
 
