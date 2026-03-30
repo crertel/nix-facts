@@ -571,12 +571,52 @@ STATS_SQL
             ];
 
             shellHook = ''
-              echo "nix-facts dev shell"
-              echo "Run 'nix-facts help' for usage."
-              if [ -f "${enriched-db}" ]; then
-                echo "Using enriched DB (with dependency edges)"
-              else
-                echo "Run 'nix-facts-enrich' to enable deps/dep-maintainers commands."
+              if [ -z "''${NIX_FACTS_QUIET:-}" ]; then
+                echo ""
+                echo "=== nix-facts ==="
+                echo "Query Nixpkgs metadata from a local DuckDB database."
+                echo ""
+
+                # DB stats
+                PKG_COUNT=$(${pkgs.duckdb}/bin/duckdb -readonly -noheader -csv "${base-db}" "SELECT count(*) FROM packages;" 2>/dev/null || echo "?")
+                echo "Database: $PKG_COUNT packages loaded"
+                echo ""
+
+                # Available commands
+                echo "Commands (base):"
+                echo "  search <term>        Search packages by name/description"
+                echo "  maintainer <github>  Packages by maintainer"
+                echo "  top-maintainers      Top maintainers by package count"
+                echo "  orphans              Packages with no maintainers"
+                echo "  broken               Packages marked as broken"
+                echo "  unfree               Packages marked as unfree"
+                echo "  platforms <attr>     Supported platforms for a package"
+                echo "  db [args...]         Raw DuckDB session"
+                echo ""
+                echo "Commands (requires enrich):"
+                echo "  deps <attr>          Transitive dependencies"
+                echo "  direct-deps <attr>   Dependencies to given depth"
+                echo "  dep-maintainers <attr>  Maintainers of transitive deps"
+                echo "  no-tests             Packages without tests"
+                echo "  no-update-script     Packages without update scripts"
+                echo ""
+
+                # Enrichment status
+                if [ -f "${enriched-db}" ]; then
+                  if [ "${base-db}" -nt "${enriched-db}" ]; then
+                    echo "Warning: enriched DB may be stale (base DB is newer)."
+                    echo "  Run 'nix-facts-enrich' to refresh."
+                  else
+                    echo "Enriched DB: available"
+                  fi
+                else
+                  echo "Enriched DB: not found"
+                  echo "  Run 'nix-facts-enrich' to enable deps/passthru commands."
+                fi
+
+                echo ""
+                echo "Run 'nix-facts help' for detailed usage."
+                echo ""
               fi
             '';
           };
