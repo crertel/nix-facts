@@ -14,16 +14,11 @@ with simple CLI commands or raw SQL.
 
 ```bash
 # From a local checkout
-nix develop --option sandbox relaxed
+nix develop
 
 # Or directly from GitHub, no checkout needed
-nix develop github:crertel/nix-facts --option sandbox relaxed
+nix develop github:crertel/nix-facts
 ```
-
-The database build step uses `nix-env` to evaluate all of nixpkgs, which
-requires store access from inside the build sandbox. The `--option sandbox
-relaxed` flag allows this. If you already have `sandbox = relaxed` in your
-`nix.conf`, you can omit the flag.
 
 Once inside the dev shell, run `nix-facts help` to see available commands.
 

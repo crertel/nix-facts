@@ -24,24 +24,31 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
 
-          # Stage 1: Evaluate all of nixpkgs and dump package metadata to JSON.
-          # Requires `sandbox = relaxed` in nix.conf because nix-env needs
-          # store access to evaluate nixpkgs expressions.
+          # Stage 1: Evaluate all of nixpkgs and dump package metadata to NDJSON.
+          # Uses nix-eval-jobs with a fake local store so it can instantiate
+          # derivations inside the sandbox without requiring sandbox = relaxed.
           meta-json =
-            pkgs.runCommand "nixpkgs-meta-json"
+            pkgs.runCommand "nixpkgs-meta-ndjson"
               {
-                __noChroot = true;
-                nativeBuildInputs = [ pkgs.nix ];
+                __structuredAttrs = true;
+                unsafeDiscardReferences.out = true;
+                nativeBuildInputs = [ pkgs.nix-eval-jobs ];
               }
               ''
-                # Preload nixpkgs source into tmpfs so the evaluator reads
-                # ~100K small .nix files from RAM instead of random disk I/O.
-                WORK=$(mktemp -d --tmpdir nixpkgs-eval.XXXXXXXXXX)
-                cp -a ${nixpkgs} "$WORK/nixpkgs"
+                                # Set up a fake local store so nix-eval-jobs can instantiate
+                                # derivations inside the sandbox without daemon access.
+                                export HOME=$PWD
+                                export NIX_STATE_DIR=$PWD/nix-state
+                                export NIX_DATA_DIR=$PWD/nix-data
+                                export NIX_CONF_DIR=$PWD/nix-conf
+                                export GC_DONT_GC=1
+                                export NIX_CONFIG="experimental-features = flakes nix-command
+                store = $PWD/temp"
+                                mkdir -p temp
 
-                mkdir -p $out
-                NIXPKGS_ALLOW_UNFREE=1 NIXPKGS_ALLOW_BROKEN=1 \
-                  nix-env -f "$WORK/nixpkgs" -qaP --meta --drv-path --json > $out/meta.json
+                                mkdir -p $out
+                                NIXPKGS_ALLOW_UNFREE=1 NIXPKGS_ALLOW_BROKEN=1 \
+                                  nix-eval-jobs --meta ${nixpkgs} > $out/meta.ndjson
               '';
 
           # Stage 2: Convert the JSON dump into a DuckDB database with three tables:
@@ -60,23 +67,23 @@
                             mkdir -p $out
 
                             echo ":: Converting to NDJSON (packages)..."
-                            jq -c 'to_entries[] | {
-                              attr: .key,
-                              name: .value.name,
-                              pname: (.value.pname // null),
-                              version: (.value.version // null),
-                              drv_path: (.value.drvPath // null),
-                              description: (.value.meta.description // null),
+                            jq -c 'select(.error == null) | {
+                              attr: .attr,
+                              name: .name,
+                              pname: (.pname // null),
+                              version: (.version // null),
+                              drv_path: (.drvPath // null),
+                              description: (.meta.description // null),
                               homepage: (
-                                (.value.meta.homepage // null) |
+                                (.meta.homepage // null) |
                                 if type == "array" then .[0] // null else . end
                               ),
-                              position: (.value.meta.position // null),
-                              main_program: (.value.meta.mainProgram // null),
-                              broken: (.value.meta.broken // false),
-                              unfree: (.value.meta.unfree // false),
+                              position: (.meta.position // null),
+                              main_program: (.meta.mainProgram // null),
+                              broken: (.meta.broken // false),
+                              unfree: (.meta.unfree // false),
                               license: (
-                                (.value.meta.license // null) |
+                                (.meta.license // null) |
                                 if type == "array" then
                                   [.[] | .spdxId // .shortName // .fullName // "unknown"] | join(", ")
                                 elif type == "object" then
@@ -84,28 +91,28 @@
                                 elif type == "string" then .
                                 else null end
                               ),
-                              maintainers: [(.value.meta.maintainers // [])[] | .github // empty]
-                            }' ${meta-json}/meta.json > /tmp/packages.ndjson
+                              maintainers: [(.meta.maintainers // [])[] | .github // empty]
+                            }' ${meta-json}/meta.ndjson > /tmp/packages.ndjson
 
                             echo ":: Converting to NDJSON (maintainers)..."
-                            jq -c 'to_entries[] |
-                              .key as $attr | .value.name as $name |
-                              (.value.meta.maintainers // [])[] |
+                            jq -c 'select(.error == null) |
+                              .attr as $attr | .name as $name |
+                              (.meta.maintainers // [])[] |
                               {
                                 attr: $attr,
                                 name: $name,
                                 maintainer_name:   (.name // null),
                                 maintainer_github: (.github // null),
                                 maintainer_email:  (.email // null)
-                              }' ${meta-json}/meta.json > /tmp/maintainers.ndjson
+                              }' ${meta-json}/meta.ndjson > /tmp/maintainers.ndjson
 
                             echo ":: Converting to NDJSON (platforms)..."
-                            jq -c 'to_entries[] |
-                              .key as $attr |
-                              (.value.meta.platforms // [])[] |
+                            jq -c 'select(.error == null) |
+                              .attr as $attr |
+                              (.meta.platforms // [])[] |
                               if type == "string" then
                                 {attr: $attr, platform: .}
-                              else empty end' ${meta-json}/meta.json > /tmp/platforms.ndjson
+                              else empty end' ${meta-json}/meta.ndjson > /tmp/platforms.ndjson
 
                             echo ":: Loading into DuckDB..."
                             duckdb $out/meta.db <<'SQL'
@@ -165,10 +172,11 @@
               (pkgs.writeShellScriptBin "nix-facts-enrich" ''
                                 set -euo pipefail
 
-                                # Step 1: Extract attr paths from meta.json and force-instantiate
+                                # Step 1: Extract attr paths from meta.ndjson and force-instantiate
                                 # all derivations so their .drv files exist in the store.
-                                echo ":: Extracting attr paths from meta.json..."
-                                ${jq} 'keys' ${meta-json}/meta.json > /tmp/nf_attrs.json
+                                echo ":: Extracting attr paths from meta.ndjson..."
+                                ${jq} -r 'select(.error == null) | .attr' ${meta-json}/meta.ndjson \
+                                  | ${jq} -Rs 'split("\n") | map(select(. != ""))' > /tmp/nf_attrs.json
                                 TOTAL=$(${jq} 'length' /tmp/nf_attrs.json)
                                 echo "  Found $TOTAL package attribute paths"
 
@@ -195,8 +203,8 @@
                                 echo "  Instantiated $INSTANTIATED derivations"
 
                                 # Step 2: Extract drv paths and filter to those now in the store
-                                echo ":: Extracting drv paths from meta.json..."
-                                ${jq} -r 'to_entries[].value.drvPath // empty' ${meta-json}/meta.json \
+                                echo ":: Extracting drv paths from meta.ndjson..."
+                                ${jq} -r 'select(.error == null) | .drvPath // empty' ${meta-json}/meta.ndjson \
                                   | sort -u > /tmp/nf_all_drvs.txt
                                 DRVTOTAL=$(wc -l < /tmp/nf_all_drvs.txt)
                                 echo "  Found $DRVTOTAL unique derivation paths"
@@ -412,7 +420,7 @@
                                     query "SELECT p.attr AS package, p.name, p.version, p.description, p.homepage,
                                        p.license, p.main_program, p.broken, p.unfree,
                                        CASE WHEN p.position IS NOT NULL THEN
-                                         regexp_extract(p.position, '.*/nixpkgs/(.*)$', 1)
+                                         regexp_extract(p.position, '/nix/store/[^/]+/(.*)', 1)
                                        ELSE NULL END AS source,
                                        p.drv_path, to_json(p.maintainers) AS maintainers
                                        $PASSTHRU_COLS
