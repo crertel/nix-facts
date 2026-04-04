@@ -376,7 +376,8 @@
                                   echo "  deps <attr>           Transitive dependencies (needs enrich)"
                                   echo "  direct-deps <attr> [depth]  Dependencies to given depth (needs enrich)"
                                   echo "  dep-maintainers <attr> Maintainers of transitive deps (needs enrich)"
-                                  echo "  audit [target]        Health audit of a runtime closure"
+                                  echo "  audit-system          Health audit of the running NixOS system"
+                                  echo "  audit-devshell <ref>  Health audit of a flake's dev shell closure"
                                   echo "  stats                 Database sizes and row counts"
                                   echo "  db [args...]          Raw DuckDB session"
                                   echo ""
@@ -626,45 +627,41 @@
                                 ORDER BY package_count DESC $LIMIT;"
                                     ;;
 
-                                  audit)
+                                  audit-system|audit-devshell)
                                     # Phase A: Resolve input to a store path
-                                    AUDIT_TARGET="''${ARGS[1]:-}"
-                                    if [ -z "$AUDIT_TARGET" ]; then
+                                    if [ "$CMD" = "audit-system" ]; then
                                       if [ -e /run/current-system ]; then
                                         STORE_PATH="/run/current-system"
                                         progress "Auditing current running system..."
                                       else
                                         echo "ERROR: /run/current-system not found (not NixOS?)." >&2
-                                        echo "Please provide a target: nix-facts audit <flake-ref|.nix file|store path>" >&2
                                         exit 1
                                       fi
-                                    elif [[ "$AUDIT_TARGET" == /nix/store/* ]]; then
-                                      if [ ! -e "$AUDIT_TARGET" ]; then
-                                        echo "ERROR: Store path does not exist: $AUDIT_TARGET" >&2
-                                        exit 1
-                                      fi
-                                      STORE_PATH="$AUDIT_TARGET"
-                                      progress "Auditing store path: $STORE_PATH"
-                                    elif [[ "$AUDIT_TARGET" == *.nix ]] && [ -f "$AUDIT_TARGET" ]; then
-                                      progress "Building $AUDIT_TARGET..."
-                                      if ! STORE_PATH=$(nix-build --no-out-link "$AUDIT_TARGET"); then
-                                        echo "ERROR: nix-build failed." >&2
-                                        exit 1
-                                      fi
-                                      STORE_PATH=$(echo "$STORE_PATH" | grep '^/nix/store/' | head -n1)
-                                      progress "Auditing: $STORE_PATH"
-                                    elif [[ "$AUDIT_TARGET" == *#* ]]; then
-                                      progress "Building $AUDIT_TARGET..."
-                                      if ! STORE_PATH=$(nix build --no-link --print-out-paths "$AUDIT_TARGET"); then
-                                        echo "ERROR: nix build failed." >&2
-                                        exit 1
-                                      fi
-                                      STORE_PATH=$(echo "$STORE_PATH" | grep '^/nix/store/' | head -n1)
-                                      progress "Auditing: $STORE_PATH"
                                     else
-                                      progress "Building $AUDIT_TARGET..."
-                                      if ! STORE_PATH=$(nix build --no-link --print-out-paths "$AUDIT_TARGET"); then
-                                        echo "ERROR: nix build failed." >&2
+                                      AUDIT_TARGET="''${ARGS[1]:-}"
+                                      if [ -z "$AUDIT_TARGET" ]; then
+                                        echo "Usage: nix-facts audit-devshell <flake-ref>" >&2
+                                        echo "Examples:" >&2
+                                        echo "  nix-facts audit-devshell ." >&2
+                                        echo "  nix-facts audit-devshell ./flake.nix" >&2
+                                        echo "  nix-facts audit-devshell github:user/repo" >&2
+                                        exit 1
+                                      fi
+
+                                      # Resolve to a flake directory
+                                      if [[ "$AUDIT_TARGET" == *.nix ]] && [ -f "$AUDIT_TARGET" ]; then
+                                        FLAKE_DIR="$(dirname "$(realpath "$AUDIT_TARGET")")"
+                                      elif [ -d "$AUDIT_TARGET" ]; then
+                                        FLAKE_DIR="$(realpath "$AUDIT_TARGET")"
+                                      else
+                                        FLAKE_DIR="$AUDIT_TARGET"
+                                      fi
+
+                                      SYSTEM=$(nix eval --impure --raw --expr builtins.currentSystem)
+                                      FLAKE_REF="$FLAKE_DIR#devShells.$SYSTEM.default"
+                                      progress "Building $FLAKE_REF..."
+                                      if ! STORE_PATH=$(nix build --no-link --print-out-paths "$FLAKE_REF"); then
+                                        echo "ERROR: nix build failed for $FLAKE_REF" >&2
                                         exit 1
                                       fi
                                       STORE_PATH=$(echo "$STORE_PATH" | grep '^/nix/store/' | head -n1)
@@ -1222,7 +1219,8 @@
                 echo "  broken               Packages marked as broken"
                 echo "  unfree               Packages marked as unfree"
                 echo "  platforms <attr>     Supported platforms for a package"
-                echo "  audit [target]       Health audit of a runtime closure"
+                echo "  audit-system         Health audit of the running NixOS system"
+                echo "  audit-devshell <ref> Health audit of a flake's dev shell closure"
                 echo "  stats                Database sizes and row counts"
                 echo "  db [args...]         Raw DuckDB session"
                 echo ""
