@@ -35,7 +35,8 @@ Once inside the dev shell, run `nix-facts help` to see available commands.
 | `broken` | Packages marked as broken |
 | `unfree` | Packages marked as unfree |
 | `platforms <attr>` | Supported platforms for a package |
-| `audit [target]` | Health audit of a runtime closure |
+| `audit-system` | Health audit of the running NixOS system |
+| `audit-devshell <ref>` | Health audit of a flake's dev shell closure |
 | `stats` | Database sizes and row counts |
 | `db [args...]` | Open a raw DuckDB session |
 
@@ -53,19 +54,20 @@ These commands require running `nix-facts-enrich` first (see below):
 
 ### Closure audit
 
-The `audit` command cross-references a Nix closure's runtime dependencies against
-the nix-facts database, reporting maintainer coverage, test coverage, and update
-script coverage.
+The audit commands cross-reference a Nix closure's runtime dependencies against
+the nix-facts database, reporting maintainer coverage, broken/unfree packages,
+and (with enrichment) test and update script coverage.
 
 ```bash
-nix-facts audit                              # current running NixOS system
-nix-facts audit .#nixosConfigurations.myhost  # flake reference
-nix-facts audit ./shell.nix                  # .nix file
-nix-facts audit /nix/store/...-system        # store path directly
+nix-facts audit-system                          # current running NixOS system
+nix-facts audit-devshell .                      # current flake's dev shell
+nix-facts audit-devshell ./flake.nix            # dev shell from a flake.nix path
+nix-facts audit-devshell ~/projects/myapp       # dev shell from a directory
+nix-facts audit-devshell github:user/repo       # dev shell from a remote flake
 ```
 
-Without enrichment, only maintainer coverage is shown. Run `nix-facts-enrich` to
-enable test and update script metrics.
+Without enrichment, only maintainer and broken/unfree coverage is shown. Run
+`nix-facts-enrich` to enable test and update script metrics.
 
 ## Output formats
 
